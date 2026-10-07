@@ -1,0 +1,47 @@
+const express = require('express');
+const router = express.Router();
+const {
+  createMatch,
+  submitRoomCode,
+  joinMatch,
+  cancelMatch,
+  requestCancel,
+  acceptCancel,
+  submitWinDispute,
+  checkMatchWaiting,
+  checkExpiry,
+  getMyMatches,
+  getMatchDetail,
+  submitResult,
+  submitResultBase64,
+  submitLoss,
+  cancelAsLoss,
+  getLudoSettings,
+  getWaitingList,
+  getRunningBattles,
+} = require('../controllers/ludoController');
+const { protect } = require('../middleware/auth');
+const upload = require('../middleware/upload');
+
+router.use(protect);
+
+router.post('/create', createMatch);
+router.post('/submit-room-code', submitRoomCode);
+router.post('/join', joinMatch);
+router.post('/cancel', cancelMatch);
+router.post('/request-cancel', requestCancel);
+router.post('/accept-cancel', acceptCancel);
+router.post('/submit-win-dispute', upload.single('screenshot'), submitWinDispute);
+router.post('/check-expiry', checkExpiry);
+router.get('/match/:id/check', checkMatchWaiting);
+router.get('/settings', getLudoSettings);
+router.get('/my-matches', getMyMatches);
+router.get('/match/:id', getMatchDetail);
+router.post('/submit-result', upload.single('screenshot'), submitResult);
+router.post('/submit-result-base64', submitResultBase64);
+router.post('/submit-loss', upload.single('screenshot'), submitLoss);
+router.post('/cancel-as-loss', cancelAsLoss);
+router.get('/waiting-list', getWaitingList);
+router.get('/running-battles', getRunningBattles);
+
+module.exports = router;

@@ -1,0 +1,1531 @@
+const sharp = require('sharp');
+const User = require('../models/User');
+const LudoMatch = require('../models/LudoMatch');
+const LudoResultRequest = require('../models/LudoResultRequest');
+const Notification = require('../models/Notification');
+const AdminSettings = require('../models/AdminSettings');
+const { uploadFromBuffer } = require('../config/cloudinary');
+const { calcLudoCommission, getCommissionTiers } = require('../utils/ludoCommission');
+const { recordWalletTx } = require('../utils/recordWalletTx');
+const { creditReferralCommission } = require('../utils/creditReferralCommission');
+const { sendPushToAdmins } = require('../config/firebase');
+
+const ENTRY_MIN = 50;
+const WAITING_EXPIRY_MINUTES = 10;
+const MAX_PLAYERS = 2;
+const ROOM_CODE_EXPIRY_MINUTES = 4;
+
+// Auto-resolve: if request has one 'win' and one 'loss' from different players, credit winner
+async function autoResolveIfPossible(request, match, io) {
+  try {
+    const winClaim = request.claims.find((c) => c.type === 'win');
+    const lossClaim = request.claims.find((c) => c.type === 'loss');
+    if (!winClaim || !lossClaim) return false;
+    if (winClaim.userId.toString() === lossClaim.userId.toString()) return false;
+    if (request.status === 'resolved') return false;
+
+    // Atomic claim — prevent double-credit race when both players submit simultaneously
+    const claimed = await LudoResultRequest.findOneAndUpdate(
+      { _id: request._id, status: 'pending' },
+      { $set: { status: 'resolved', reviewedAt: new Date(), adminNote: 'Auto-resolved — both players agreed (win + loss)', winnerId: winClaim.userId } },
+      { new: true }
+    );
+    if (!claimed) return false; // Another concurrent call already resolved it
+
+    const winnerId = winClaim.userId;
+    const { commission, winnerAmount } = await calcLudoCommission(
+      match.players.reduce((s, p) => s + p.amountPaid, 0),
+      match.entryAmount
+    );
+
+    const winner = await User.findById(winnerId);
+    if (!winner) return false;
+    const balBeforeWin = winner.walletBalance;
+    winner.creditEarnings(winnerAmount);
+    await winner.save();
+
+    await recordWalletTx(
+      winnerId, 'credit', 'ludo_win', winnerAmount,
+      `Ludo match won — ₹${winnerAmount} prize`,
+      balBeforeWin, winner.walletBalance, match._id
+    );
+
+    // Referral commission — 2% of bet amount (entryAmount) to referrer
+    await creditReferralCommission(winnerId, match.entryAmount, match._id, 'ludo', io);
+
+    match.status = 'completed';
+    match.winnerId = winnerId;
+    await match.save();
+
+    // Notify winner
+    const winnerNotif = await Notification.create({
+      userId: winnerId,
+      title: 'You Won!',
+      message: `Congratulations! You won Rs. ${winnerAmount} in Ludo match.`,
+      type: 'game',
+    });
+    if (io) {
+      io.to(`user_${winnerId}`).emit('notification:new', winnerNotif);
+      io.to(`user_${winnerId}`).emit('wallet:balance-updated', { walletBalance: winner.walletBalance, depositBalance: winner.depositBalance, earningsBalance: winner.earningsBalance });
+    }
+
+    // Notify loser
+    const loserPlayer = match.players.find((p) => p.userId.toString() !== winnerId.toString());
+    if (loserPlayer) {
+      const loserNotif = await Notification.create({
+        userId: loserPlayer.userId,
+        title: 'Match Result',
+        message: `You lost the Ludo match (₹${match.entryAmount}). Better luck next time!`,
+        type: 'game',
+      });
+      if (io) io.to(`user_${loserPlayer.userId}`).emit('notification:new', loserNotif);
+    }
+
+    if (io) {
+      io.emit('ludo:match-live');
+      io.emit('ludo:waiting-updated');
+    }
+
+    console.log('[autoResolve] Auto-resolved matchId:', match._id, '| winner:', winner.name, '| amount:', winnerAmount);
+    return true;
+  } catch (err) {
+    console.error('[autoResolve] Error:', err.message);
+    return false;
+  }
+}
+
+// @desc    Create Ludo match (entry amount only; room code added later after opponent joins)
+// @route   POST /api/ludo/create
+const createMatch = async (req, res) => {
+  try {
+    // Check if Ludo is enabled
+    const adminSettings = await AdminSettings.findOne({ key: 'main' });
+    if (adminSettings && adminSettings.ludoEnabled === false) {
+      const reason = adminSettings.ludoDisableReason || 'Ludo games are currently disabled.';
+      return res.status(403).json({ message: reason });
+    }
+
+    const { entryAmount } = req.body;
+    const amount = Number(entryAmount);
+
+    if (!amount || amount < ENTRY_MIN) {
+      return res.status(400).json({ message: `Minimum entry is Rs. ${ENTRY_MIN}` });
+    }
+    if (!Number.isInteger(amount) || amount % 50 !== 0) {
+      return res.status(400).json({ message: 'Amount must be in multiples of 50 (e.g. 50, 100, 150, 200, 250)' });
+    }
+
+    const user = await User.findById(req.user._id);
+    if (user.walletBalance < amount) {
+      return res.status(400).json({ message: 'Insufficient balance' });
+    }
+
+    // Max 2 waiting matches per user
+    const waitingCount = await LudoMatch.countDocuments({ creatorId: req.user._id, status: 'waiting' });
+    if (waitingCount >= 2) {
+      return res.status(400).json({ message: 'You can have at most 2 open battles at a time.' });
+    }
+
+    const joinExpiryAt = new Date(Date.now() + WAITING_EXPIRY_MINUTES * 60 * 1000);
+
+    // Balance is NOT deducted at create time — deduction happens when opponent joins.
+    const match = await LudoMatch.create({
+      entryAmount: amount,
+      creatorId: req.user._id,
+      creatorName: user.name,
+      status: 'waiting',
+      players: [{ userId: req.user._id, userName: user.name, amountPaid: 0, paidFromDeposit: 0, paidFromEarnings: 0, joinedAt: new Date() }],
+      joinExpiryAt,
+      siteType: req.user.siteType || 'rushkroludo',
+    });
+
+    const io = req.app.get('io');
+    io.emit('ludo:waiting-updated');
+
+    res.status(201).json({
+      message: 'Match created. Wait for someone to join.',
+      match: {
+        _id: match._id,
+        entryAmount: match.entryAmount,
+        status: match.status,
+        joinExpiryAt: match.joinExpiryAt,
+      },
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: 'Server error' });
+  }
+};
+
+// @desc    Submit Ludo King room code (creator only) — game starts immediately
+// @route   POST /api/ludo/submit-room-code
+const submitRoomCode = async (req, res) => {
+  try {
+    const { matchId, roomCode } = req.body;
+    if (!matchId || !roomCode || typeof roomCode !== 'string') {
+      return res.status(400).json({ message: 'Match ID and room code are required' });
+    }
+
+    const code = String(roomCode).trim().toUpperCase().slice(0, 10);
+    if (!code) return res.status(400).json({ message: 'Invalid room code' });
+
+    const pre = await LudoMatch.findById(matchId).lean();
+    if (!pre) return res.status(404).json({ message: 'Match not found' });
+    if (pre.creatorId.toString() !== req.user._id.toString()) {
+      return res.status(403).json({ message: 'Only the creator can submit the room code' });
+    }
+    if (pre.status !== 'waiting' && pre.status !== 'live') {
+      return res.status(400).json({ message: 'Cannot set room code for this match' });
+    }
+    // Once a room code is set it is FROZEN — cannot be changed by anyone, ever.
+    // Return the existing code so the client UI re-syncs to the original value.
+    if (pre.roomCode && pre.roomCode.trim() !== '') {
+      return res.status(400).json({
+        message: 'Room code is already set and cannot be changed.',
+        match: {
+          _id: pre._id,
+          roomCode: pre.roomCode,
+          entryAmount: pre.entryAmount,
+          status: pre.status,
+          gameActualStartAt: pre.gameActualStartAt,
+          gameStartedAt: pre.gameStartedAt,
+        },
+      });
+    }
+
+    const now = new Date();
+
+    // ── ATOMIC SET-ONCE ──
+    // Filter requires roomCode is missing/empty AND match is the creator's AND status is waiting/live.
+    // If two requests race (e.g., double-tap on the Submit button) only the first wins; the second
+    // gets a null back and we return the existing (now frozen) code.
+    const match = await LudoMatch.findOneAndUpdate(
+      {
+        _id: matchId,
+        creatorId: req.user._id,
+        status: { $in: ['waiting', 'live'] },
+        $or: [{ roomCode: { $exists: false } }, { roomCode: '' }, { roomCode: null }],
+      },
+      {
+        $set: {
+          roomCode: code,
+          gameActualStartAt: now,
+          gameStartedAt: now,
+        },
+      },
+      { new: true }
+    );
+    if (!match) {
+      // Lost the race — fetch current state and return the frozen code.
+      const current = await LudoMatch.findById(matchId).lean();
+      return res.status(400).json({
+        message: 'Room code is already set and cannot be changed.',
+        match: current && current.roomCode ? {
+          _id: current._id,
+          roomCode: current.roomCode,
+          entryAmount: current.entryAmount,
+          status: current.status,
+          gameActualStartAt: current.gameActualStartAt,
+          gameStartedAt: current.gameStartedAt,
+        } : null,
+      });
+    }
+
+    // Notify both players via socket that game has started
+    const io = req.app.get('io');
+    if (io) {
+      for (const player of match.players) {
+        io.to(`user_${player.userId}`).emit('ludo:game-started', {
+          matchId: match._id.toString(),
+          roomCode: code,
+          gameActualStartAt: match.gameActualStartAt,
+          gameStartedAt: match.gameStartedAt,
+        });
+      }
+    }
+
+    res.json({
+      message: 'Room code saved. Game started!',
+      match: {
+        _id: match._id,
+        roomCode: match.roomCode,
+        entryAmount: match.entryAmount,
+        status: match.status,
+        gameActualStartAt: match.gameActualStartAt,
+      },
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: 'Server error' });
+  }
+};
+
+// @desc    Join match by matchId (Confirm and Start). Check status is still waiting.
+// @route   POST /api/ludo/join
+const joinMatch = async (req, res) => {
+  try {
+    // Check if Ludo is enabled
+    const adminSettings = await AdminSettings.findOne({ key: 'main' });
+    if (adminSettings && adminSettings.ludoEnabled === false) {
+      const reason = adminSettings.ludoDisableReason || 'Ludo games are currently disabled.';
+      return res.status(403).json({ message: reason });
+    }
+
+    const { matchId } = req.body;
+    if (!matchId) {
+      return res.status(400).json({ message: 'Match ID is required' });
+    }
+
+    // Pre-checks (non-atomic) — friendly errors before claiming the match
+    const preCheck = await LudoMatch.findById(matchId).lean();
+    if (!preCheck) return res.status(404).json({ message: 'Match not found' });
+    if (preCheck.creatorId.toString() === req.user._id.toString()) {
+      return res.status(400).json({ message: 'You cannot join your own match' });
+    }
+    if (preCheck.joinExpiryAt && new Date() > preCheck.joinExpiryAt) {
+      return res.status(400).json({ message: 'This match has expired' });
+    }
+
+    // Block if joiner already has a running bet (live/cancel_requested) with no result request yet.
+    // Once a result request exists for that match, it's effectively over so this user can accept new bets.
+    const matchIdsWithResult = await LudoResultRequest.find({}).distinct('matchId');
+    const runningBet = await LudoMatch.findOne({
+      $or: [{ creatorId: req.user._id }, { 'players.userId': req.user._id }],
+      status: { $in: ['live', 'cancel_requested'] },
+      _id: { $nin: matchIdsWithResult },
+    }).select('_id').lean();
+    if (runningBet) {
+      return res.status(400).json({ message: 'You already have a running bet. Finish it (or submit the result) before joining another.' });
+    }
+
+    // ── STEP 1: Atomically claim the match ──
+    // Only ONE joiner can win this — prevents double-join race condition entirely.
+    const match = await LudoMatch.findOneAndUpdate(
+      { _id: matchId, status: 'waiting', creatorId: { $ne: req.user._id } },
+      { $set: { status: 'live', gameStartedAt: new Date(), roomCodeExpiryAt: new Date(Date.now() + ROOM_CODE_EXPIRY_MINUTES * 60 * 1000) } },
+      { new: true }
+    );
+    if (!match) {
+      return res.status(400).json({ message: 'This game has been taken by another person.' });
+    }
+
+    // ── STEP 2: Deduct joiner's balance (atomic) ──
+    const joiner = await User.findOneAndUpdate(
+      { _id: req.user._id, walletBalance: { $gte: match.entryAmount } },
+      { $inc: { walletBalance: -match.entryAmount } },
+      { new: false } // returns BEFORE state for deposit/earnings split
+    );
+    if (!joiner) {
+      // Joiner has no balance — revert match to waiting so someone else can join
+      await LudoMatch.findOneAndUpdate(
+        { _id: match._id },
+        { $set: { status: 'waiting', gameStartedAt: null, roomCodeExpiryAt: null } }
+      );
+      return res.status(400).json({ message: 'Insufficient balance' });
+    }
+    const jDep = Math.min(joiner.depositBalance || 0, match.entryAmount);
+    const jEarn = match.entryAmount - jDep;
+    await User.updateOne({ _id: joiner._id }, { $inc: { depositBalance: -jDep, earningsBalance: -jEarn } });
+
+    // ── STEP 3: Deduct creator's balance (atomic) ──
+    const creator = await User.findOneAndUpdate(
+      { _id: match.creatorId, walletBalance: { $gte: match.entryAmount } },
+      { $inc: { walletBalance: -match.entryAmount } },
+      { new: false }
+    );
+    if (!creator) {
+      // Creator ran out of money — refund joiner and cancel match
+      await User.updateOne({ _id: joiner._id }, { $inc: { walletBalance: match.entryAmount, depositBalance: jDep, earningsBalance: jEarn } });
+      await LudoMatch.findOneAndUpdate(
+        { _id: match._id },
+        { $set: { status: 'cancelled', cancelledAt: new Date(), cancelReason: 'Creator insufficient balance at join time' } }
+      );
+      return res.status(400).json({ message: 'Match creator no longer has sufficient balance. Match cancelled.' });
+    }
+    const cDep = Math.min(creator.depositBalance || 0, match.entryAmount);
+    const cEarn = match.entryAmount - cDep;
+    await User.updateOne({ _id: creator._id }, { $inc: { depositBalance: -cDep, earningsBalance: -cEarn } });
+
+    // Record wallet transactions for both
+    await recordWalletTx(
+      joiner._id, 'debit', 'ludo_entry', match.entryAmount,
+      `Ludo match joined — entry fee ₹${match.entryAmount}`,
+      joiner.walletBalance, joiner.walletBalance - match.entryAmount, match._id
+    );
+    await recordWalletTx(
+      creator._id, 'debit', 'ludo_entry', match.entryAmount,
+      `Ludo match started — entry fee ₹${match.entryAmount}`,
+      creator.walletBalance, creator.walletBalance - match.entryAmount, match._id
+    );
+
+    // ── STEP 4: Update match with actual player payment data ──
+    // match is the document returned by findOneAndUpdate (new:true), safe to modify + save
+    match.players[0].amountPaid = match.entryAmount;
+    match.players[0].paidFromDeposit = cDep;
+    match.players[0].paidFromEarnings = cEarn;
+    match.players.push({
+      userId: req.user._id,
+      userName: joiner.name,
+      amountPaid: match.entryAmount,
+      paidFromDeposit: jDep,
+      paidFromEarnings: jEarn,
+      joinedAt: new Date(),
+    });
+    await match.save();
+
+    // Emit balance updates to both players via socket
+    const io = req.app.get('io');
+    const [joinerUpdated, creatorUpdated] = await Promise.all([
+      User.findById(joiner._id).select('walletBalance depositBalance earningsBalance'),
+      User.findById(creator._id).select('walletBalance depositBalance earningsBalance'),
+    ]);
+    io.to(`user_${joiner._id}`).emit('wallet:balance-updated', { walletBalance: joinerUpdated.walletBalance, depositBalance: joinerUpdated.depositBalance, earningsBalance: joinerUpdated.earningsBalance });
+    io.to(`user_${creator._id}`).emit('wallet:balance-updated', { walletBalance: creatorUpdated.walletBalance, depositBalance: creatorUpdated.depositBalance, earningsBalance: creatorUpdated.earningsBalance });
+
+    // Auto-cancel other waiting matches created by EITHER player — no refund needed (nothing was deducted at create)
+    await LudoMatch.updateMany(
+      { creatorId: { $in: [match.creatorId, req.user._id] }, status: 'waiting', _id: { $ne: match._id } },
+      { $set: { status: 'cancelled', cancelledAt: new Date(), cancelReason: 'Auto-cancelled — another match went live' } }
+    );
+
+    io.emit('ludo:match-live', { matchId: match._id, match: match.toObject ? match.toObject() : match });
+    io.emit('ludo:waiting-updated');
+    io.to(`admins_${req.user.siteType || 'rushkroludo'}`).emit('admin:ludo-match-live', { matchId: match._id });
+
+    // Notify creator that opponent joined
+    const creatorNotif = await Notification.create({
+      userId: match.creatorId,
+      title: 'Opponent Joined!',
+      message: `${joiner.name || 'A player'} joined your Ludo match (₹${match.entryAmount}). Open Ludo King and start playing!`,
+      type: 'game',
+    });
+    io.to(`user_${match.creatorId}`).emit('notification:new', creatorNotif);
+
+    res.json({
+      message: 'You joined the match. Open Ludo King app and paste the room code.',
+      match: {
+        _id: match._id,
+        roomCode: match.roomCode,
+        entryAmount: match.entryAmount,
+        status: match.status,
+        gameStartedAt: match.gameStartedAt,
+        players: match.players,
+      },
+      newBalance: joinerUpdated.walletBalance,
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: 'Server error' });
+  }
+};
+
+// Cancel reason labels (for display)
+const CANCEL_REASON_LABELS = {
+  connection_issue: 'Internet / Connection में Problem',
+  game_not_loaded: 'Game Load नहीं हुआ',
+  wrong_room_code: 'Room Code गलत था',
+  opponent_left: 'Opponent ने Game छोड़ दिया',
+  other: 'अन्य कारण',
+};
+
+// Win dispute reason labels
+const WIN_REASON_LABELS = {
+  i_won_clearly: 'I Won the Game',
+  i_clearly_won: 'I Won the Game',
+  opponent_left_mid_game: 'Opponent left mid game',
+  have_proof: 'I have screenshot proof',
+  unfair_cancel: 'Cancel request was unfair',
+  other: 'Other Reason',
+};
+
+// @desc    Request cancel after game has started — saves reason, notifies opponent
+// @route   POST /api/ludo/request-cancel
+const requestCancel = async (req, res) => {
+  try {
+    const { matchId, reasonCode, customReason } = req.body;
+    if (!matchId) return res.status(400).json({ message: 'Match ID is required' });
+    if (!reasonCode) return res.status(400).json({ message: 'Cancel reason is required' });
+
+    const match = await LudoMatch.findById(matchId);
+    if (!match) return res.status(404).json({ message: 'Match not found' });
+
+    const userId = req.user._id.toString();
+    const isPlayer = match.players.some((p) => p.userId.toString() === userId);
+    if (!isPlayer) return res.status(403).json({ message: 'You are not in this match' });
+
+    if (match.status !== 'live') {
+      return res.status(400).json({ message: 'Cancel request can only be made for live matches' });
+    }
+    if (!match.roomCode || !match.roomCode.trim()) {
+      return res.status(400).json({ message: 'Game has not started yet. Use regular cancel instead.' });
+    }
+
+    // Check no result request already exists
+    const hasRequest = await LudoResultRequest.findOne({ matchId: match._id });
+    if (hasRequest) {
+      return res.status(400).json({ message: 'A result request already exists for this match.' });
+    }
+
+    const reasonLabel = CANCEL_REASON_LABELS[reasonCode] || reasonCode;
+    const displayReason = reasonCode === 'other' ? (customReason || 'अन्य कारण') : reasonLabel;
+
+    // Atomic transition live → cancel_requested. If both players hit "Cancel" at the same time,
+    // only one wins and becomes the canceller; the other gets a clear "already requested" error
+    // and their UI will refresh to the Accept/Dispute dialog.
+    const claimed = await LudoMatch.findOneAndUpdate(
+      { _id: match._id, status: 'live' },
+      {
+        $set: {
+          status: 'cancel_requested',
+          cancelRequestedBy: req.user._id,
+          cancelRequestedAt: new Date(),
+          cancelReasonCode: reasonCode,
+          cancelReasonCustom: reasonCode === 'other' ? customReason : null,
+        },
+      },
+      { new: true }
+    );
+    if (!claimed) {
+      return res.status(400).json({ message: 'Match state changed — opponent may have already requested cancel. Please refresh.' });
+    }
+    match.status = claimed.status;
+    match.cancelRequestedBy = claimed.cancelRequestedBy;
+
+    const io = req.app.get('io');
+    const otherPlayer = match.players.find((p) => p.userId.toString() !== userId);
+
+    if (otherPlayer) {
+      const notif = await Notification.create({
+        userId: otherPlayer.userId,
+        title: 'Cancel Request मिली',
+        message: `${req.user.name} ने game cancel करने की request दी है। कारण: "${displayReason}"`,
+        type: 'game',
+      });
+      if (io) {
+        io.to(`user_${otherPlayer.userId}`).emit('notification:new', notif);
+        io.to(`user_${otherPlayer.userId}`).emit('ludo:cancel-requested', {
+          matchId: match._id.toString(),
+          cancellerName: req.user.name,
+          reasonCode,
+          displayReason,
+        });
+      }
+    }
+
+    // Notify canceller too
+    if (io) {
+      io.to(`user_${userId}`).emit('ludo:cancel-request-sent', { matchId: match._id.toString() });
+    }
+
+    res.json({ message: 'Cancel request submitted. Opponent has been notified.' });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: 'Server error' });
+  }
+};
+
+// @desc    Accept opponent's cancel request — auto-resolve with full refund, no admin review
+// @route   POST /api/ludo/accept-cancel
+const acceptCancel = async (req, res) => {
+  try {
+    const { matchId } = req.body;
+    if (!matchId) return res.status(400).json({ message: 'Match ID is required' });
+
+    // ── Pre-checks (friendly errors) ──
+    const pre = await LudoMatch.findById(matchId).lean();
+    if (!pre) return res.status(404).json({ message: 'Match not found' });
+
+    const userId = req.user._id.toString();
+    const isPlayer = pre.players.some((p) => p.userId.toString() === userId);
+    if (!isPlayer) return res.status(403).json({ message: 'You are not in this match' });
+    if (pre.status !== 'cancel_requested') {
+      return res.status(400).json({ message: 'No pending cancel request for this match' });
+    }
+    if (!pre.cancelRequestedBy || pre.cancelRequestedBy.toString() === userId) {
+      return res.status(400).json({ message: 'You cannot accept your own cancel request' });
+    }
+
+    // ── ATOMIC LOCK ──
+    // LudoResultRequest.matchId has a unique index. Creating one here is our single-winner gate:
+    // if any other path (submitWinDispute, submitResult, submitLoss) is racing to make one, exactly
+    // one of us wins. We create it already resolved so the admin never sees it as pending.
+    let lockReq;
+    try {
+      lockReq = await LudoResultRequest.create({
+        matchId: pre._id,
+        disputeType: 'cancel_accepted',
+        claims: [],
+        status: 'resolved',
+        reviewedAt: new Date(),
+        adminNote: 'Auto-resolved — both players agreed to cancel, full refund issued',
+      });
+    } catch (err) {
+      if (err && err.code === 11000) {
+        return res.status(400).json({ message: 'A result request already exists for this match.' });
+      }
+      throw err;
+    }
+
+    // ── ATOMIC MATCH TRANSITION ──
+    // Flip status cancel_requested → cancelled. Must happen AFTER the lock so refunds can't double up.
+    const claimed = await LudoMatch.findOneAndUpdate(
+      { _id: pre._id, status: 'cancel_requested' },
+      { $set: { status: 'cancelled', cancelledAt: new Date(), cancelReason: 'Both players agreed to cancel — full refund' } },
+      { new: true }
+    );
+    if (!claimed) {
+      // Status was changed by someone else between our pre-check and the lock — clean up the lock so the system recovers.
+      await LudoResultRequest.deleteOne({ _id: lockReq._id });
+      return res.status(400).json({ message: 'Match state changed. Please refresh.' });
+    }
+
+    const io = req.app.get('io');
+    const refundDecisions = [];
+
+    // ── REFUND BOTH PLAYERS (atomic $inc — race-safe vs concurrent wallet ops) ──
+    for (const player of claimed.players) {
+      const refundAmt = player.amountPaid || 0;
+      if (refundAmt <= 0) {
+        // No money was actually deducted for this player — nothing to refund.
+        refundDecisions.push({ userId: player.userId, userName: player.userName, refundType: 'full', amount: 0 });
+        continue;
+      }
+
+      // Split refund the same way the entry fee was deducted (deposit vs earnings).
+      const paidDep = player.paidFromDeposit || 0;
+      const paidEarn = player.paidFromEarnings || 0;
+      const total = paidDep + paidEarn;
+      const refundToDeposit = total > 0
+        ? Math.round((paidDep / total) * refundAmt * 100) / 100
+        : refundAmt;
+      const refundToEarnings = Math.round((refundAmt - refundToDeposit) * 100) / 100;
+
+      const updated = await User.findOneAndUpdate(
+        { _id: player.userId },
+        { $inc: { walletBalance: refundAmt, depositBalance: refundToDeposit, earningsBalance: refundToEarnings } },
+        { new: true }
+      );
+      if (!updated) continue;
+
+      const balBefore = updated.walletBalance - refundAmt;
+      await recordWalletTx(
+        player.userId, 'credit', 'ludo_refund', refundAmt,
+        `Ludo match cancelled — both players agreed, ₹${refundAmt} refunded`,
+        balBefore, updated.walletBalance, claimed._id
+      );
+
+      refundDecisions.push({
+        userId: player.userId,
+        userName: player.userName,
+        refundType: 'full',
+        amount: refundAmt,
+      });
+
+      const notif = await Notification.create({
+        userId: player.userId,
+        title: 'Match Cancelled — Full Refund',
+        message: `दोनों players ने cancel पर agree किया। ₹${refundAmt} आपके wallet में वापस कर दिया गया।`,
+        type: 'game',
+      });
+      if (io) {
+        io.to(`user_${player.userId}`).emit('notification:new', notif);
+        io.to(`user_${player.userId}`).emit('ludo:match-cancelled', { matchId: claimed._id.toString() });
+        io.to(`user_${player.userId}`).emit('wallet:balance-updated', {
+          walletBalance: updated.walletBalance,
+          depositBalance: updated.depositBalance,
+          earningsBalance: updated.earningsBalance,
+        });
+      }
+    }
+
+    // Audit trail on the result request so admin can see why/how it was auto-resolved.
+    lockReq.refundDecisions = refundDecisions;
+    await lockReq.save();
+
+    if (io) {
+      io.emit('ludo:match-live');
+      io.emit('ludo:waiting-updated');
+    }
+
+    res.json({ message: 'Cancel accepted. Full refund credited to both players.' });
+  } catch (error) {
+    console.error('[acceptCancel] ERROR:', error.message, error.stack);
+    res.status(500).json({ message: 'Server error' });
+  }
+};
+
+// @desc    Submit win claim after opponent's cancel request (dispute)
+// @route   POST /api/ludo/submit-win-dispute (multipart: screenshot)
+const submitWinDispute = async (req, res) => {
+  try {
+    const { matchId, winReasonCode, winReasonCustom } = req.body;
+    if (!matchId) return res.status(400).json({ message: 'Match ID is required' });
+    if (!winReasonCode) return res.status(400).json({ message: 'Win reason is required' });
+    if (!req.file || !req.file.buffer) {
+      return res.status(400).json({ message: 'Screenshot is required' });
+    }
+
+    const match = await LudoMatch.findById(matchId);
+    if (!match) return res.status(404).json({ message: 'Match not found' });
+
+    const userId = req.user._id.toString();
+    const isPlayer = match.players.some((p) => p.userId.toString() === userId);
+    if (!isPlayer) return res.status(403).json({ message: 'You are not in this match' });
+
+    if (match.status !== 'cancel_requested') {
+      return res.status(400).json({ message: 'No pending cancel request for this match' });
+    }
+    // Only the OTHER player (not the canceller) can submit win dispute
+    if (match.cancelRequestedBy.toString() === userId) {
+      return res.status(400).json({ message: 'You cannot submit a win claim on your own cancel request' });
+    }
+
+    let request = await LudoResultRequest.findOne({ matchId: match._id });
+    if (request) {
+      return res.status(400).json({ message: 'A result request already exists for this match.' });
+    }
+
+    let screenshotUrl;
+    try {
+      screenshotUrl = await uploadFromBuffer(req.file.buffer, 'lean_aviator/ludo_results', req.file.mimetype || 'image/jpeg');
+    } catch (uploadErr) {
+      console.error(uploadErr);
+      return res.status(500).json({ message: 'Failed to upload screenshot' });
+    }
+
+    const winReasonLabel = WIN_REASON_LABELS[winReasonCode] || winReasonCode;
+    const displayWinReason = winReasonCode === 'other' ? (winReasonCustom || 'अन्य') : winReasonLabel;
+
+    request = await LudoResultRequest.create({
+      matchId: match._id,
+      disputeType: 'cancel_dispute',
+      claims: [{
+        userId: req.user._id,
+        userName: req.user.name,
+        type: 'win_dispute',
+        screenshotUrl,
+        winReasonCode,
+        winReasonCustom: winReasonCode === 'other' ? winReasonCustom : null,
+        createdAt: new Date(),
+      }],
+      status: 'pending',
+    });
+
+    const io = req.app.get('io');
+    io.to(`admins_${req.user.siteType || 'rushkroludo'}`).emit('admin:ludo-result-request', {
+      requestId: request._id,
+      matchId: match._id,
+      userName: req.user.name,
+      disputeType: 'cancel_dispute',
+    });
+
+    await Notification.create({
+      userId: req.user._id,
+      title: 'Win Dispute Submitted',
+      message: `आपका win claim submit हो गया (कारण: "${displayWinReason}")। Admin verify करेगा।`,
+      type: 'game',
+    });
+
+    // Notify the canceller that opponent disputed
+    const cancellerPlayer = match.players.find((p) => p.userId.toString() === match.cancelRequestedBy.toString());
+    if (cancellerPlayer) {
+      const notif = await Notification.create({
+        userId: cancellerPlayer.userId,
+        title: 'Opponent ने Win Claim किया',
+        message: `${req.user.name} ने आपकी cancel request को dispute किया है। Admin decide करेगा।`,
+        type: 'game',
+      });
+      if (io) {
+        io.to(`user_${cancellerPlayer.userId}`).emit('notification:new', notif);
+        // Trigger UI refresh on canceller's screen
+        io.to(`user_${cancellerPlayer.userId}`).emit('ludo:win-dispute-submitted', { matchId: match._id.toString() });
+      }
+    }
+
+    // Push notification to admins
+    sendPushToAdmins(
+      'Ludo Win Dispute',
+      `${req.user.name} ne win dispute submit kiya - Rs.${match.entryAmount} match`,
+      { type: 'ludo_dispute' },
+      req.user.siteType || 'rushkroludo'
+    );
+
+    res.status(201).json({ message: 'Win dispute submitted. Admin will review and decide.', request: { _id: request._id } });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: 'Server error' });
+  }
+};
+
+// @desc    Cancel match — 3 cases: waiting (creator only), live+no room code (either player), live+room code (reject)
+// @route   POST /api/ludo/cancel
+const cancelMatch = async (req, res) => {
+  try {
+    const { matchId } = req.body;
+    const match = await LudoMatch.findById(matchId);
+    if (!match) return res.status(404).json({ message: 'Match not found' });
+
+    const userId = req.user._id.toString();
+    const isCreator = match.creatorId.toString() === userId;
+    const isPlayer = match.players.some((p) => p.userId.toString() === userId);
+
+    // Case 1: Waiting — only creator can cancel
+    if (match.status === 'waiting') {
+      if (!isCreator) {
+        return res.status(403).json({ message: 'Only the creator can cancel' });
+      }
+
+      // Atomic claim — prevents race with cron expiry
+      const claimed = await LudoMatch.findOneAndUpdate(
+        { _id: match._id, status: 'waiting' },
+        { $set: { status: 'cancelled', cancelledAt: new Date(), cancelReason: 'Creator cancelled' } },
+        { new: true }
+      );
+      if (!claimed) {
+        return res.status(400).json({ message: 'Match was already cancelled or expired.' });
+      }
+
+      // No refund needed — balance was never deducted at create time
+      const io = req.app.get('io');
+      io.emit('ludo:waiting-updated');
+
+      return res.json({ message: 'Match cancelled.' });
+    }
+
+    // Case 2: Live + no room code — either player can cancel, full refund to both
+    if (match.status === 'live') {
+      if (!isPlayer) {
+        return res.status(403).json({ message: 'You are not in this match' });
+      }
+
+      const hasRoomCode = match.roomCode && match.roomCode.trim() !== '';
+      if (hasRoomCode) {
+        return res.status(400).json({ message: 'Game has started. Use "Cancel as loss" instead.' });
+      }
+
+      // Atomic claim — prevents race with expireRoomCodeMatches cron
+      const claimed = await LudoMatch.findOneAndUpdate(
+        { _id: match._id, status: 'live', $or: [{ roomCode: { $exists: false } }, { roomCode: '' }, { roomCode: null }] },
+        { $set: { status: 'cancelled', cancelledAt: new Date(), cancelReason: 'Cancelled before room code (full refund)' } },
+        { new: true }
+      );
+      if (!claimed) {
+        return res.status(400).json({ message: 'Match was already cancelled or room code was submitted.' });
+      }
+
+      // Full refund to both players (atomic $inc)
+      const io = req.app.get('io');
+      for (const player of match.players) {
+        const pUser = await User.findById(player.userId);
+        if (pUser) {
+          const refundAmt = player.amountPaid;
+          const paidDep = player.paidFromDeposit || 0;
+          const paidEarn = player.paidFromEarnings || 0;
+          const total = paidDep + paidEarn;
+          const refundToDeposit = total > 0 ? Math.round((paidDep / total) * refundAmt * 100) / 100 : refundAmt;
+          const refundToEarnings = refundAmt - refundToDeposit;
+          const balBef = pUser.walletBalance;
+          const updatedP = await User.findOneAndUpdate(
+            { _id: pUser._id },
+            { $inc: { walletBalance: refundAmt, depositBalance: refundToDeposit, earningsBalance: refundToEarnings } },
+            { new: true }
+          );
+          await recordWalletTx(
+            pUser._id, 'credit', 'ludo_refund', refundAmt,
+            `Ludo match cancelled before room code — ₹${refundAmt} refunded`,
+            balBef, updatedP.walletBalance, match._id
+          );
+
+          if (io) {
+            io.to(`user_${player.userId}`).emit('wallet:balance-updated', { walletBalance: updatedP.walletBalance, depositBalance: updatedP.depositBalance, earningsBalance: updatedP.earningsBalance });
+            io.to(`user_${player.userId}`).emit('ludo:match-cancelled', { matchId: match._id.toString() });
+          }
+        }
+      }
+
+      if (io) {
+        io.emit('ludo:match-live');
+        io.emit('ludo:waiting-updated');
+      }
+
+      const updatedUser = await User.findById(req.user._id);
+      return res.json({
+        message: 'Match cancelled. Full refund to both players.',
+        newBalance: updatedUser.walletBalance,
+      });
+    }
+
+    return res.status(400).json({ message: 'Match cannot be cancelled in its current state.' });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: 'Server error' });
+  }
+};
+
+// @desc    Get single match for join flow (check if still waiting; no auth for viewing list, but join requires auth)
+// @route   GET /api/ludo/match/:id/check
+const checkMatchWaiting = async (req, res) => {
+  try {
+    const match = await LudoMatch.findById(req.params.id)
+      .select('_id entryAmount creatorName status joinExpiryAt roomCode')
+      .lean();
+    if (!match) return res.status(404).json({ message: 'Match not found' });
+    if (match.status !== 'waiting') {
+      return res.json({ ok: false, message: 'This game has been taken by another person.' });
+    }
+    if (match.joinExpiryAt && new Date() > match.joinExpiryAt) {
+      return res.json({ ok: false, message: 'This match has expired.' });
+    }
+    res.json({ ok: true, match: { _id: match._id, entryAmount: match.entryAmount, creatorName: match.creatorName, joinExpiryAt: match.joinExpiryAt } });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: 'Server error' });
+  }
+};
+
+// @desc    Get my matches (waiting / live / history)
+// @route   GET /api/ludo/my-matches?status=waiting|live|history&page=1&limit=25
+const getMyMatches = async (req, res) => {
+  try {
+    const { status, page = 1, limit = 25 } = req.query;
+    const pageNum = Math.max(1, parseInt(page));
+    const limitNum = Math.min(100, Math.max(1, parseInt(limit)));
+    const skip = (pageNum - 1) * limitNum;
+    const userId = req.user._id;
+
+    const query = {
+      $or: [{ creatorId: userId }, { 'players.userId': userId }],
+    };
+
+    if (status === 'waiting') {
+      query.status = 'waiting';
+    } else if (status === 'live') {
+      // Include both live and cancel_requested (so both players can see and respond)
+      query.status = { $in: ['live', 'cancel_requested'] };
+      // Exclude matches that already have a result request (pending admin review)
+      const matchIdsWithResult = await LudoResultRequest.find({}).distinct('matchId');
+      if (matchIdsWithResult.length > 0) {
+        query._id = { $nin: matchIdsWithResult };
+      }
+    } else if (status === 'requested') {
+      // Matches with a result request (pending admin review) — includes cancel disputes
+      query.status = { $in: ['live', 'cancel_requested'] };
+      const matchIdsWithResult = await LudoResultRequest.find({}).distinct('matchId');
+      if (matchIdsWithResult.length > 0) {
+        query._id = { $in: matchIdsWithResult };
+      } else {
+        return res.json({ records: [], totalCount: 0, page: 1, totalPages: 0 });
+      }
+    } else if (status === 'history') {
+      query.status = { $in: ['completed', 'cancelled'] };
+    }
+
+    const [matches, totalCount] = await Promise.all([
+      LudoMatch.find(query)
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(limitNum)
+        .lean(),
+      LudoMatch.countDocuments(query),
+    ]);
+
+    res.json({
+      records: matches,
+      totalCount,
+      page: pageNum,
+      totalPages: Math.ceil(totalCount / limitNum),
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: 'Server error' });
+  }
+};
+
+// @desc    Get single match detail (participant only) + result request if any
+// @route   GET /api/ludo/match/:id
+const getMatchDetail = async (req, res) => {
+  try {
+    const match = await LudoMatch.findById(req.params.id).lean();
+    if (!match) return res.status(404).json({ message: 'Match not found' });
+
+    const userId = req.user._id.toString();
+    const isCreator = match.creatorId.toString() === userId;
+    const isPlayer = match.players.some((p) => p.userId.toString() === userId);
+    if (!isCreator && !isPlayer) {
+      return res.status(403).json({ message: 'You are not in this match' });
+    }
+
+    const resultRequest = await LudoResultRequest.findOne({ matchId: match._id }).lean();
+    const response = { ...match, resultRequest: resultRequest || null };
+    res.json(response);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: 'Server error' });
+  }
+};
+
+// @desc    Submit result (screenshot) - claim win. One request per match; add claim.
+// @route   POST /api/ludo/submit-result (multipart: screenshot)
+const submitResult = async (req, res) => {
+  try {
+    const { matchId } = req.body;
+    console.log('[submitResult] matchId:', matchId, '| user:', req.user?.name, '| file:', req.file?.originalname, req.file?.size, 'bytes');
+    if (!matchId) return res.status(400).json({ message: 'Match ID is required' });
+    if (!req.file || !req.file.buffer) {
+      console.log('[submitResult] FAIL: no file attached');
+      return res.status(400).json({ message: 'Screenshot is required' });
+    }
+
+    const match = await LudoMatch.findById(matchId);
+    if (!match) { console.log('[submitResult] FAIL: match not found'); return res.status(404).json({ message: 'Match not found' }); }
+
+    const userId = req.user._id.toString();
+    const isPlayer = match.players.some((p) => p.userId.toString() === userId);
+    if (!isPlayer) { console.log('[submitResult] FAIL: not a player'); return res.status(403).json({ message: 'You are not in this match' }); }
+    if (match.status !== 'live') {
+      console.log('[submitResult] FAIL: match status is', match.status);
+      return res.status(400).json({ message: 'Result can only be submitted for live matches' });
+    }
+
+    let request = await LudoResultRequest.findOne({ matchId: match._id });
+    if (request && request.claims.some((c) => c.userId.toString() === userId)) {
+      console.log('[submitResult] FAIL: user already submitted claim');
+      return res.status(400).json({ message: 'You have already submitted a claim for this match.' });
+    }
+    if (request && request.status === 'resolved') {
+      console.log('[submitResult] FAIL: request already resolved');
+      return res.status(400).json({ message: 'This match result is already resolved.' });
+    }
+
+    let screenshotUrl;
+    try {
+      screenshotUrl = await uploadFromBuffer(req.file.buffer, 'lean_aviator/ludo_results', req.file.mimetype || 'image/jpeg');
+    } catch (uploadErr) {
+      console.error(uploadErr);
+      return res.status(500).json({ message: 'Failed to upload screenshot' });
+    }
+
+    const { winReasonCode, winReasonCustom } = req.body;
+    const claim = {
+      userId: req.user._id,
+      userName: req.user.name,
+      type: 'win',
+      screenshotUrl,
+      winReasonCode: winReasonCode || null,
+      winReasonCustom: winReasonCode === 'other' ? (winReasonCustom || null) : null,
+      createdAt: new Date(),
+    };
+
+    if (!request) {
+      request = await LudoResultRequest.create({
+        matchId: match._id,
+        claims: [claim],
+        status: 'pending',
+      });
+    } else {
+      request.claims.push(claim);
+      await request.save();
+    }
+
+    const io = req.app.get('io');
+
+    // Try auto-resolve (win + loss from both players)
+    const autoResolved = await autoResolveIfPossible(request, match, io);
+    if (autoResolved) {
+      console.log('[submitResult] Auto-resolved: requestId:', request._id);
+      return res.status(201).json({
+        message: 'Result confirmed automatically. Winnings credited!',
+        request: { _id: request._id, status: 'resolved' },
+        autoResolved: true,
+      });
+    }
+
+    io.to(`admins_${req.user.siteType || 'rushkroludo'}`).emit('admin:ludo-result-request', {
+      requestId: request._id,
+      matchId: match._id,
+      userName: req.user.name,
+    });
+
+    // Notify the opponent that this user submitted a win claim
+    const otherPlayer = match.players.find((p) => p.userId.toString() !== userId);
+    if (otherPlayer && io) {
+      io.to(`user_${otherPlayer.userId}`).emit('ludo:win-claimed', {
+        matchId: match._id.toString(),
+        claimerName: req.user.name,
+      });
+    }
+
+    await Notification.create({
+      userId: req.user._id,
+      title: 'Result Submitted',
+      message: 'Your Ludo match result has been submitted for admin approval.',
+      type: 'game',
+    });
+
+    // Push notification to admins
+    sendPushToAdmins(
+      'Ludo Result Submitted',
+      `${req.user.name} ne Rs.${match.entryAmount} match ka result submit kiya`,
+      { type: 'ludo_result' },
+      req.user.siteType || 'rushkroludo'
+    );
+
+    console.log('[submitResult] SUCCESS: requestId:', request._id, '| matchId:', matchId, '| user:', req.user?.name);
+    res.status(201).json({
+      message: 'Result submitted. Admin will verify and approve.',
+      request: { _id: request._id, status: request.status },
+    });
+  } catch (error) {
+    console.error('[submitResult] ERROR:', error.message, error.stack);
+    res.status(500).json({ message: 'Server error' });
+  }
+};
+
+// @desc    Submit result with base64 screenshot (fallback when multipart upload fails)
+// @route   POST /api/ludo/submit-result-base64
+const submitResultBase64 = async (req, res) => {
+  try {
+    const { matchId, winReasonCode, winReasonCustom, screenshotBase64 } = req.body;
+    if (!matchId) return res.status(400).json({ message: 'Match ID is required' });
+    if (!screenshotBase64) return res.status(400).json({ message: 'Screenshot is required' });
+
+    const match = await LudoMatch.findById(matchId);
+    if (!match) return res.status(404).json({ message: 'Match not found' });
+
+    const userId = req.user._id.toString();
+    const isPlayer = match.players.some((p) => p.userId.toString() === userId);
+    if (!isPlayer) return res.status(403).json({ message: 'You are not in this match' });
+    if (match.status !== 'live') {
+      return res.status(400).json({ message: 'Result can only be submitted for live matches' });
+    }
+
+    let request = await LudoResultRequest.findOne({ matchId: match._id });
+    if (request && request.claims.some((c) => c.userId.toString() === userId)) {
+      return res.status(400).json({ message: 'You have already submitted a claim for this match.' });
+    }
+    if (request && request.status === 'resolved') {
+      return res.status(400).json({ message: 'This match result is already resolved.' });
+    }
+
+    let screenshotUrl;
+    try {
+      // screenshotBase64 is already a data URI like "data:image/jpeg;base64,..."
+      const result = await new Promise((resolve, reject) => {
+        require('../config/cloudinary').cloudinary.uploader.upload(screenshotBase64, {
+          folder: 'lean_aviator/ludo_results',
+          resource_type: 'image',
+        }, (err, result) => {
+          if (err) return reject(err);
+          resolve(result);
+        });
+      });
+      screenshotUrl = result.secure_url;
+    } catch (uploadErr) {
+      console.error('[submitResultBase64] Cloudinary also failed, storing base64 directly');
+      // Store base64 directly as last resort
+      screenshotUrl = screenshotBase64;
+    }
+
+    const claim = {
+      userId: req.user._id,
+      userName: req.user.name,
+      type: 'win',
+      screenshotUrl,
+      winReasonCode: winReasonCode || null,
+      winReasonCustom: winReasonCode === 'other' ? (winReasonCustom || null) : null,
+      createdAt: new Date(),
+    };
+
+    if (!request) {
+      request = await LudoResultRequest.create({
+        matchId: match._id,
+        claims: [claim],
+        status: 'pending',
+      });
+    } else {
+      request.claims.push(claim);
+      await request.save();
+    }
+
+    const io = req.app.get('io');
+
+    // Try auto-resolve (win + loss from both players)
+    const autoResolved = await autoResolveIfPossible(request, match, io);
+    if (autoResolved) {
+      console.log('[submitResultBase64] Auto-resolved: requestId:', request._id);
+      return res.status(201).json({
+        message: 'Result confirmed automatically. Winnings credited!',
+        request: { _id: request._id, status: 'resolved' },
+        autoResolved: true,
+      });
+    }
+
+    io.to(`admins_${req.user.siteType || 'rushkroludo'}`).emit('admin:ludo-result-request', {
+      requestId: request._id,
+      matchId: match._id,
+      userName: req.user.name,
+    });
+
+    // Notify the opponent that this user submitted a win claim
+    const otherPlayer = match.players.find((p) => p.userId.toString() !== userId);
+    if (otherPlayer && io) {
+      io.to(`user_${otherPlayer.userId}`).emit('ludo:win-claimed', {
+        matchId: match._id.toString(),
+        claimerName: req.user.name,
+      });
+    }
+
+    await Notification.create({
+      userId: req.user._id,
+      title: 'Result Submitted',
+      message: 'Your Ludo match result has been submitted for admin approval.',
+      type: 'game',
+    });
+
+    sendPushToAdmins(
+      'Ludo Result Submitted',
+      `${req.user.name} ne Rs.${match.entryAmount} match ka result submit kiya`,
+      { type: 'ludo_result' },
+      req.user.siteType || 'rushkroludo'
+    );
+
+    console.log('[submitResultBase64] SUCCESS: requestId:', request._id, '| matchId:', matchId, '| user:', req.user?.name);
+    res.status(201).json({
+      message: 'Result submitted. Admin will verify and approve.',
+      request: { _id: request._id, status: request.status },
+    });
+  } catch (error) {
+    console.error('[submitResultBase64] ERROR:', error.message, error.stack);
+    res.status(500).json({ message: 'Server error' });
+  }
+};
+
+// @desc    Submit "I lost" - add loss claim to same request (screenshot required)
+// @route   POST /api/ludo/submit-loss
+const submitLoss = async (req, res) => {
+  try {
+    const { matchId } = req.body;
+    console.log('[submitLoss] matchId:', matchId, '| user:', req.user?.name, '| file:', req.file?.originalname, req.file?.size, 'bytes');
+    if (!matchId) return res.status(400).json({ message: 'Match ID is required' });
+
+    const match = await LudoMatch.findById(matchId);
+    if (!match) { console.log('[submitLoss] FAIL: match not found'); return res.status(404).json({ message: 'Match not found' }); }
+
+    const userId = req.user._id.toString();
+    const isPlayer = match.players.some((p) => p.userId.toString() === userId);
+    if (!isPlayer) { console.log('[submitLoss] FAIL: not a player'); return res.status(403).json({ message: 'You are not in this match' }); }
+    if (match.status !== 'live') {
+      console.log('[submitLoss] FAIL: match status is', match.status);
+      return res.status(400).json({ message: 'Match is not live' });
+    }
+
+    let request = await LudoResultRequest.findOne({ matchId: match._id });
+    if (request && request.claims.some((c) => c.userId.toString() === userId)) {
+      return res.status(400).json({ message: 'You have already submitted a claim for this match.' });
+    }
+    if (request && request.status === 'resolved') {
+      return res.status(400).json({ message: 'This match result is already resolved.' });
+    }
+
+    let screenshotUrl = null;
+    if (req.file && req.file.buffer) {
+      try {
+        screenshotUrl = await uploadFromBuffer(req.file.buffer, 'lean_aviator/ludo_results', req.file.mimetype || 'image/jpeg');
+      } catch (uploadErr) {
+        console.error(uploadErr);
+        // Screenshot upload failed but loss can still proceed without it
+      }
+    }
+
+    const claim = {
+      userId: req.user._id,
+      userName: req.user.name,
+      type: 'loss',
+      screenshotUrl,
+      createdAt: new Date(),
+    };
+
+    if (!request) {
+      request = await LudoResultRequest.create({
+        matchId: match._id,
+        claims: [claim],
+        status: 'pending',
+      });
+    } else {
+      request.claims.push(claim);
+      await request.save();
+    }
+
+    const io = req.app.get('io');
+
+    // Try auto-resolve (win + loss from both players)
+    const autoResolved = await autoResolveIfPossible(request, match, io);
+    if (autoResolved) {
+      console.log('[submitLoss] Auto-resolved: requestId:', request._id);
+      return res.json({
+        message: 'Result confirmed automatically. Winnings credited to winner!',
+        request: { _id: request._id, status: 'resolved' },
+        autoResolved: true,
+      });
+    }
+
+    io.to(`admins_${req.user.siteType || 'rushkroludo'}`).emit('admin:ludo-result-request', { requestId: request._id, matchId: match._id, userName: req.user.name });
+
+    // Notify the OTHER player that this user submitted loss
+    const otherPlayer = match.players.find((p) => p.userId.toString() !== userId);
+    if (otherPlayer && io) {
+      io.to(`user_${otherPlayer.userId}`).emit('ludo:loss-submitted', {
+        matchId: match._id.toString(),
+        loserName: req.user.name,
+        winnerName: otherPlayer.userName,
+      });
+    }
+
+    console.log('[submitLoss] SUCCESS: requestId:', request._id, '| matchId:', matchId, '| user:', req.user?.name);
+    res.json({ message: 'Loss submitted. Admin will decide winner.', request: { _id: request._id } });
+  } catch (error) {
+    console.error('[submitLoss] ERROR:', error.message, error.stack);
+    res.status(500).json({ message: 'Server error' });
+  }
+};
+
+// @desc    Cancel as "I lost" (forfeit) - only after room code. 0% refund to canceller, 100% to other.
+// @route   POST /api/ludo/cancel-as-loss
+const cancelAsLoss = async (req, res) => {
+  try {
+    const { matchId } = req.body;
+    if (!matchId) return res.status(400).json({ message: 'Match ID is required' });
+
+    const match = await LudoMatch.findById(matchId);
+    if (!match) return res.status(404).json({ message: 'Match not found' });
+
+    const userId = req.user._id.toString();
+    const isPlayer = match.players.some((p) => p.userId.toString() === userId);
+    if (!isPlayer) return res.status(403).json({ message: 'You are not in this match' });
+    if (match.status !== 'live') {
+      return res.status(400).json({ message: 'Match is not live' });
+    }
+
+    // Guard: only allowed after room code has been set (game started)
+    if (!match.roomCode || !match.roomCode.trim()) {
+      return res.status(400).json({ message: 'Game has not started yet. Use regular cancel instead.' });
+    }
+
+    const hasRequest = await LudoResultRequest.findOne({ matchId: match._id });
+    if (hasRequest && hasRequest.claims && hasRequest.claims.length > 0) {
+      return res.status(400).json({ message: 'A result request already exists. You cannot cancel.' });
+    }
+
+    const entryAmount = match.entryAmount;
+    // Canceller gets 0% — full penalty for cancelling after game has started
+    // Other player gets 100% refund of their own bet only
+    const cancellerRefund = 0;
+    const otherRefund = entryAmount;
+
+    const canceller = await User.findById(req.user._id);
+    const otherPlayer = match.players.find((p) => p.userId.toString() !== userId);
+    if (!otherPlayer) return res.status(400).json({ message: 'Invalid match' });
+
+    // Canceller gets nothing — no wallet update
+    const cancellerPlayer = match.players.find((p) => p.userId.toString() === userId);
+    if (cancellerRefund > 0) canceller.smartRefund(cancellerRefund, cancellerPlayer?.paidFromDeposit, cancellerPlayer?.paidFromEarnings);
+    await canceller.save();
+
+    const otherUser = await User.findById(otherPlayer.userId);
+    if (otherUser) {
+      const balBeforeOther = otherUser.walletBalance;
+      otherUser.smartRefund(otherRefund, otherPlayer.paidFromDeposit, otherPlayer.paidFromEarnings);
+      await otherUser.save();
+      await recordWalletTx(
+        otherUser._id, 'credit', 'ludo_refund', otherRefund,
+        `Ludo match — opponent forfeited, ₹${otherRefund} refunded`,
+        balBeforeOther, otherUser.walletBalance, match._id
+      );
+    }
+
+    match.status = 'cancelled';
+    match.cancelledAt = new Date();
+    match.cancelReason = 'User forfeit (I lost)';
+    match.winnerId = otherPlayer.userId;
+    await match.save();
+
+    const io = req.app.get('io');
+    io.emit('ludo:match-live');
+    io.emit('ludo:waiting-updated');
+
+    res.json({
+      message: 'You cancelled. No refund. Other player received their entry back.',
+      newBalance: canceller.walletBalance,
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: 'Server error' });
+  }
+};
+
+// @desc    Get Ludo settings (e.g. game duration for display)
+// @route   GET /api/ludo/settings
+const getLudoSettings = async (req, res) => {
+  try {
+    const settings = await AdminSettings.findOne({ key: 'main' }).select('ludoDummyRunningBattles ludoCommTier1Max ludoCommTier1Pct ludoCommTier2Max ludoCommTier2Pct ludoCommTier3Pct ludoEnabled ludoDisableReason ludoWarning').lean();
+    res.json({
+      ludoDummyRunningBattles: settings?.ludoDummyRunningBattles ?? 15,
+      ludoCommTier1Max: settings?.ludoCommTier1Max ?? 250,
+      ludoCommTier1Pct: settings?.ludoCommTier1Pct ?? 10,
+      ludoCommTier2Max: settings?.ludoCommTier2Max ?? 600,
+      ludoCommTier2Pct: settings?.ludoCommTier2Pct ?? 8,
+      ludoCommTier3Pct: settings?.ludoCommTier3Pct ?? 5,
+      ludoEnabled: settings?.ludoEnabled ?? true,
+      ludoDisableReason: settings?.ludoDisableReason || '',
+      ludoWarning: settings?.ludoWarning || '',
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: 'Server error' });
+  }
+};
+
+// @desc    Get list of waiting matches (others' matches only; for "Join" - click to Confirm and Start)
+// @route   GET /api/ludo/waiting-list
+const getWaitingList = async (req, res) => {
+  try {
+    const list = await LudoMatch.find({
+      status: 'waiting',
+      joinExpiryAt: { $gt: new Date() },
+      creatorId: { $ne: req.user._id },
+    })
+      .select('_id entryAmount creatorName createdAt joinExpiryAt')
+      .sort({ createdAt: -1 })
+      .limit(50)
+      .lean();
+
+    res.json(list);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: 'Server error' });
+  }
+};
+
+// @desc    Get all running (live) battles for display - same single entry/prize per match; users only see list
+// @route   GET /api/ludo/running-battles
+const getRunningBattles = async (req, res) => {
+  try {
+    // Exclude matches that have result requests (game is over, pending admin review)
+    const matchIdsWithResult = await LudoResultRequest.find({}).distinct('matchId');
+    const liveQuery = { status: 'live' };
+    if (matchIdsWithResult.length > 0) {
+      liveQuery._id = { $nin: matchIdsWithResult };
+    }
+
+    const [list, tiers] = await Promise.all([
+      LudoMatch.find(liveQuery)
+        .select('_id entryAmount players gameExpiryAt')
+        .sort({ gameStartedAt: -1 })
+        .limit(50)
+        .lean(),
+      getCommissionTiers(),
+    ]);
+
+    const battles = await Promise.all(list.map(async (m) => {
+      const pool = (m.players || []).reduce((s, p) => s + (p.amountPaid || 0), 0) || m.entryAmount * 2;
+      const { winnerAmount: prize } = await calcLudoCommission(pool, m.entryAmount, tiers);
+      return {
+        _id: m._id,
+        entryAmount: m.entryAmount,
+        playingFor: m.entryAmount,
+        prize,
+        players: (m.players || []).map((p) => ({ userName: p.userName })),
+        gameExpiryAt: m.gameExpiryAt,
+      };
+    }));
+
+    res.json(battles);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: 'Server error' });
+  }
+};
+
+// @desc    Check & expire match if room code timer is up (called by frontend when countdown hits 0)
+// @route   POST /api/ludo/check-expiry
+const checkExpiry = async (req, res) => {
+  try {
+    const { matchId } = req.body;
+    const match = await LudoMatch.findById(matchId);
+    if (!match) return res.status(404).json({ message: 'Match not found' });
+
+    // Only act on live matches with no room code and expired timer
+    if (match.status !== 'live') return res.json({ expired: false, status: match.status });
+    if (match.roomCode && match.roomCode.trim() !== '') return res.json({ expired: false, status: 'live' });
+    if (!match.roomCodeExpiryAt || new Date() < new Date(match.roomCodeExpiryAt)) {
+      return res.json({ expired: false, status: 'live' });
+    }
+
+    // Timer is up — atomically claim the match before refunding (prevents race with cron)
+    const claimed = await LudoMatch.findOneAndUpdate(
+      { _id: match._id, status: 'live', $or: [{ roomCode: { $exists: false } }, { roomCode: '' }, { roomCode: null }] },
+      { $set: { status: 'cancelled', cancelledAt: new Date(), cancelReason: 'Room code not shared in time' } },
+      { new: true }
+    );
+    if (!claimed) {
+      return res.json({ expired: false, status: match.status });
+    }
+
+    const io = req.app.get('io');
+    for (const player of claimed.players) {
+      const u = await User.findById(player.userId);
+      if (u) {
+        const balBef = u.walletBalance;
+        u.smartRefund(player.amountPaid, player.paidFromDeposit, player.paidFromEarnings);
+        await u.save();
+        await recordWalletTx(
+          u._id, 'credit', 'ludo_refund', player.amountPaid,
+          `Room code not shared in time — ₹${player.amountPaid} refunded`,
+          balBef, u.walletBalance, claimed._id
+        );
+      }
+
+      await Notification.create({
+        userId: player.userId,
+        type: 'game',
+        title: 'Ludo Match Expired',
+        message: `Room code नहीं डाला गया। ₹${player.amountPaid} आपके wallet में वापस कर दिया गया।`,
+      });
+
+      if (io) {
+        io.to(`user_${player.userId}`).emit('ludo:match-cancelled', { matchId: claimed._id.toString() });
+        io.to(`user_${player.userId}`).emit('wallet:balance-updated');
+      }
+    }
+
+    console.log(`[Ludo] Room code expired for match ${match._id} (triggered by client), refunded both`);
+
+    if (io) io.emit('ludo:waiting-updated');
+
+    res.json({ expired: true, status: 'cancelled' });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: 'Server error' });
+  }
+};
+
+module.exports = {
+  createMatch,
+  submitRoomCode,
+  joinMatch,
+  cancelMatch,
+  requestCancel,
+  acceptCancel,
+  submitWinDispute,
+  checkMatchWaiting,
+  checkExpiry,
+  getMyMatches,
+  getMatchDetail,
+  submitResult,
+  submitResultBase64,
+  submitLoss,
+  cancelAsLoss,
+  getLudoSettings,
+  getWaitingList,
+  getRunningBattles,
+};
