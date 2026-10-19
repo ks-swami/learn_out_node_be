@@ -21,7 +21,7 @@ async function sendOtpSms(phone, otp) {
   const url = process.env.SMSINDIAHUB_URL || 'https://cloud.smsindiahub.in/api/mt/SendSMS';
   const dltTemplateId = process.env.SMSINDIAHUB_DLT_TEMPLATE_ID || '1007801291964877107';
   const peId = process.env.SMSINDIAHUB_PE_ID || '1701158019630577568';
-  const entityName = process.env.SMSINDIAHUB_ENTITY_NAME || 'RushkroLudo';
+  const entityName = process.env.SMSINDIAHUB_ENTITY_NAME || 'Cashout';
 
   const cleanPhone = String(phone || '').replace(/[^0-9]/g, '');
   if (!cleanPhone || cleanPhone.length < 10) {
@@ -83,4 +83,3 @@ async function sendOtpSms(phone, otp) {
 }
 
 module.exports = { sendOtpSms };
-
